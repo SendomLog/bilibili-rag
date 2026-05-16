@@ -49,6 +49,22 @@ cp .env.example .env
 # 编辑 .env，填写 DashScope API Key 等配置
 ```
 
+推荐的百炼 / DashScope OpenAI 兼容配置：
+```env
+DASHSCOPE_API_KEY=你的百炼 API Key
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL=qwen3-plus
+EMBEDDING_MODEL=text-embedding-v4
+```
+
+注意：
+- `.env` 必须放在项目根目录，不是 `frontend/` 目录
+- `OPENAI_BASE_URL` 用于 LLM 对话，推荐使用 `https://dashscope.aliyuncs.com/compatible-mode/v1`
+- `DASHSCOPE_BASE_URL` 只用于 ASR，不要和 `OPENAI_BASE_URL` 混用
+- 修改 `.env` 后需要重启后端服务
+- 不要把真实 API Key 提交到 GitHub
+
 3) 启动服务  
 ```bash
 python -m uvicorn app.main:app --reload
@@ -146,6 +162,20 @@ npm run dev
 建议：
 - 部署/测试阶段先用 **短视频（约 10 分钟）**验证流程与费用  
 - 正式使用按需启用，注意费用；大多数模型有免费额度，通常足够日常使用  
+
+### 模型配置常见错误
+
+**Q：报错 `The api_key client option must be set` 是什么原因？**  
+A：后端没有读到有效 API Key。请检查 `.env` 是否在项目根目录，并确认至少配置了 `DASHSCOPE_API_KEY` 或 `OPENAI_API_KEY`。
+
+**Q：百炼 / DashScope 的 `OPENAI_BASE_URL` 应该填什么？**  
+A：推荐填 `https://dashscope.aliyuncs.com/compatible-mode/v1`。不要填 `https://coding.dashscope.aliyuncs.com/v1`，也不要把 ASR 的 `DASHSCOPE_BASE_URL` 填到这里。
+
+**Q：报错 `AllocationQuota.FreeTierOnly` 是什么原因？**  
+A：这是上游模型服务返回的配额错误，通常表示免费额度已耗尽，或控制台开启了“仅使用免费额度”。这不是本项目代码错误，需要在模型服务控制台调整额度/付费设置，或切换可用模型。
+
+**Q：改了 `.env` 但模型没有变化？**  
+A：配置在后端启动时读取。修改 `.env` 后请重启 `uvicorn` 后端服务。
 
 ---
 

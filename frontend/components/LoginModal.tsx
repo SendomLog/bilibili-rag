@@ -10,6 +10,11 @@ interface Props {
 }
 
 export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
+  if (!isOpen) return null;
+  return <LoginDialog onClose={onClose} onSuccess={onSuccess} />;
+}
+
+function LoginDialog({ onClose, onSuccess }: Omit<Props, "isOpen">) {
   const [qr, setQr] = useState<QRCodeResponse | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "scanned" | "success" | "error">("loading");
   const [polling, setPolling] = useState(false);
@@ -27,12 +32,23 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
   };
 
   useEffect(() => {
-    if (isOpen) getQR();
-    else {
-      setPolling(false);
-      setQr(null);
-    }
-  }, [isOpen]);
+    let active = true;
+    const loadQR = async () => {
+      try {
+        const data = await authApi.getQRCode();
+        if (!active) return;
+        setQr(data);
+        setStatus("ready");
+        setPolling(true);
+      } catch {
+        if (active) setStatus("error");
+      }
+    };
+    void loadQR();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!polling || !qr) return;
@@ -53,8 +69,6 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
     return () => clearInterval(timer);
   }, [polling, qr, onSuccess]);
 
-  if (!isOpen) return null;
-
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-card" onClick={(e) => e.stopPropagation()}>
@@ -70,6 +84,8 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
 
           {(status === "ready" || status === "scanned") && qr && (
             <div className="relative">
+              {/* QR code is returned as a short-lived base64 data URL from the backend. */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={qr.qrcode_image_base64} alt="二维码" className="w-48 h-48 rounded-2xl border border-[var(--border)]" />
               {status === "scanned" && (
                 <div className="absolute inset-0 bg-white/90 rounded-2xl flex flex-col items-center justify-center">

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   FavoriteFolder,
   Video,
@@ -30,21 +30,22 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
   const [organizeLoading, setOrganizeLoading] = useState(false);
   const [organizePreview, setOrganizePreview] = useState<OrganizePreviewResponse | null>(null);
   const [organizeMessage, setOrganizeMessage] = useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   // 加载收藏夹列表（从B站获取）
-  const loadFolders = async () => {
+  const loadFolders = useCallback(async () => {
     setLoading(true);
     try {
       const data = await favoritesApi.getList(sessionId);
       setFolders(data.map((f) => ({ ...f, count_source: "bili" })));
-    } catch (e) {
-      console.error(e);
+    } catch (error) {
+      console.error(error);
     }
     setLoading(false);
-  };
+  }, [sessionId]);
 
   // 加载入库状态（从本地数据库）
-  const loadStatuses = async () => {
+  const loadStatuses = useCallback(async () => {
     try {
       const data = await knowledgeApi.getFolderStatus(sessionId);
       const map: Record<number, FolderStatus> = {};
@@ -60,21 +61,21 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
           return { ...f, count_source: "bili" };
         })
       );
-    } catch (e) {
-      console.error(e);
+    } catch (error) {
+      console.error(error);
     }
-  };
-
-  useEffect(() => {
-    loadFolders().then(loadStatuses);
   }, [sessionId]);
 
+  useEffect(() => {
+    void loadFolders().then(loadStatuses);
+  }, [loadFolders, loadStatuses]);
+
   // 刷新
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     setMessage(null);
     await loadFolders();
     await loadStatuses();
-  };
+  }, [loadFolders, loadStatuses]);
 
   const openOrganizePreview = async (folderId: number) => {
     setOrganizeMessage(null);
@@ -84,7 +85,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
     try {
       const res = await favoritesApi.organizePreview(folderId, sessionId);
       setOrganizePreview(res);
-    } catch (e) {
+    } catch {
       setOrganizeMessage("预览失败，请稍后重试");
     } finally {
       setOrganizeLoading(false);
@@ -122,14 +123,34 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
   // 选择收藏夹
   const toggleSelect = (id: number) => {
     const s = new Set(selected);
-    s.has(id) ? s.delete(id) : s.add(id);
+    if (s.has(id)) {
+      s.delete(id);
+    } else {
+      s.add(id);
+    }
     setSelected(s);
     onSelectionChange?.(Array.from(s));
   };
 
+  const selectedFolders = useMemo(
+    () => folders.filter((folder) => selected.has(folder.media_id)),
+    [folders, selected]
+  );
+
+  const selectedVideoCount = selectedFolders.reduce((sum, folder) => {
+    const status = statusMap[folder.media_id];
+    return sum + (status?.media_count ?? folder.media_count ?? 0);
+  }, 0);
+
+  const openBuildConfirm = () => {
+    if (selected.size === 0 || building) return;
+    setConfirmOpen(true);
+  };
+
   // 构建/更新知识库（统一操作）
-  const buildKnowledge = async () => {
+  const startBuildKnowledge = async () => {
     if (selected.size === 0) return;
+    setConfirmOpen(false);
     setBuilding(true);
     setMessage(null);
     setProgress(null);
@@ -155,7 +176,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
         }
       };
       poll();
-    } catch (e) {
+    } catch {
       setBuilding(false);
       setMessage("构建失败，请重试");
     }
@@ -330,6 +351,23 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
               <span className="text-[var(--muted)] truncate">{progress.current_step}</span>
               <span className="text-[var(--accent)]">{progress.progress}%</span>
             </div>
+            <div className="build-progress-meta">
+              {progress.total_folders ? (
+                <span>
+                  收藏夹 {progress.processed_folders ?? 0}/{progress.total_folders}
+                </span>
+              ) : null}
+              {progress.total_videos ? (
+                <span>
+                  视频 {progress.processed_videos}/{progress.total_videos}
+                </span>
+              ) : null}
+            </div>
+            {progress.current_video_title && (
+              <div className="build-current-title" title={progress.current_video_title}>
+                当前：{progress.current_video_title}
+              </div>
+            )}
             <div className="progress">
               <div className="progress-bar" style={{ width: `${progress.progress}%` }} />
             </div>
@@ -342,7 +380,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
 
         {/* 主按钮 */}
         <button
-          onClick={buildKnowledge}
+          onClick={openBuildConfirm}
           disabled={selected.size === 0 || building}
           className="btn btn-primary w-full"
         >
@@ -363,6 +401,51 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
         onClose={() => setOrganizeOpen(false)}
         onApplied={refresh}
       />
+
+      {confirmOpen && (
+        <div className="modal-backdrop" onClick={() => setConfirmOpen(false)}>
+          <div className="modal-card build-confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-title">确认入库</div>
+            <div className="modal-subtitle">
+              将处理 {selectedFolders.length} 个收藏夹，约 {selectedVideoCount} 个视频
+            </div>
+
+            <div className="build-confirm-list">
+              {selectedFolders.map((folder) => {
+                const status = getFolderStatus(folder.media_id, folder.media_count);
+                return (
+                  <div key={folder.media_id} className="build-confirm-item">
+                    <div>
+                      <div className="build-confirm-title" title={folder.title}>
+                        {folder.title}
+                      </div>
+                      <div className="build-confirm-meta">
+                        {status.indexedCount}/{status.totalCount ?? folder.media_count} 个视频
+                      </div>
+                    </div>
+                    <span className={`status-pill ${status.className}`}>{status.label}</span>
+                  </div>
+                );
+              })}
+            </div>
+
+            {selectedVideoCount >= 50 && (
+              <div className="build-confirm-warning">
+                本次视频较多，可能触发较长 ASR/Embedding 处理，也会产生模型调用费用。建议首次使用先小批量验证。
+              </div>
+            )}
+
+            <div className="organize-actions">
+              <button className="btn btn-outline" onClick={() => setConfirmOpen(false)}>
+                取消
+              </button>
+              <button className="btn btn-primary" onClick={startBuildKnowledge}>
+                确认开始
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

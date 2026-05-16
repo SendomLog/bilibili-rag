@@ -10,6 +10,19 @@ interface Props {
 type Step = "idle" | "typing" | "searching" | "answering" | "done";
 
 export default function DemoFlowModal({ isOpen, onClose }: Props) {
+  const [runId, setRunId] = useState(0);
+  if (!isOpen) return null;
+
+  return (
+    <DemoFlowContent
+      key={runId}
+      onClose={onClose}
+      onReplay={() => setRunId((value) => value + 1)}
+    />
+  );
+}
+
+function DemoFlowContent({ onClose, onReplay }: { onClose: () => void; onReplay: () => void }) {
   const question = "这个收藏夹里有哪些适合快速入门的 AI 视频？";
   const answer =
     "我从收藏夹中找到了 3 个适合入门的内容：\n\n" +
@@ -26,24 +39,11 @@ export default function DemoFlowModal({ isOpen, onClose }: Props) {
     []
   );
 
-  const [step, setStep] = useState<Step>("idle");
+  const [step, setStep] = useState<Step>("typing");
   const [typed, setTyped] = useState("");
   const [answerTyped, setAnswerTyped] = useState("");
-  const [runId, setRunId] = useState(0);
-
 
   useEffect(() => {
-    if (!isOpen) {
-      setStep("idle");
-      setTyped("");
-      setAnswerTyped("");
-      return;
-    }
-
-    setStep("typing");
-    setTyped("");
-    setAnswerTyped("");
-
     let typingTimer: number | null = null;
     let searchTimer: number | null = null;
     let answerTimer: number | null = null;
@@ -75,9 +75,7 @@ export default function DemoFlowModal({ isOpen, onClose }: Props) {
       if (searchTimer) window.clearTimeout(searchTimer);
       if (answerTimer) window.clearInterval(answerTimer);
     };
-  }, [isOpen, question, answer, runId]);
-
-  if (!isOpen) return null;
+  }, [question, answer]);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -127,7 +125,7 @@ export default function DemoFlowModal({ isOpen, onClose }: Props) {
             )}
 
             <div className="demo-actions">
-              <button onClick={() => setRunId((v) => v + 1)} className="btn btn-ghost">
+              <button onClick={onReplay} className="btn btn-ghost">
                 重新播放
               </button>
               <button onClick={onClose} className="btn btn-outline">

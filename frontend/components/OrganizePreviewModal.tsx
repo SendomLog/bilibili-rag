@@ -79,7 +79,7 @@ export default function OrganizePreviewModal({
       setMessage(`已移动 ${res.moved} 条内容`);
       onApplied?.();
       onClose();
-    } catch (e) {
+    } catch {
       setMessage("执行失败，请稍后重试");
     } finally {
       setSubmitting(false);
@@ -94,7 +94,7 @@ export default function OrganizePreviewModal({
       await favoritesApi.cleanInvalid(preview.default_folder_id, sessionId);
       setMessage("已清理失效内容");
       onApplied?.();
-    } catch (e) {
+    } catch {
       setMessage("清理失败，请稍后重试");
     } finally {
       setCleaning(false);

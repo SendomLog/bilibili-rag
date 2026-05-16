@@ -1,15 +1,45 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, useSyncExternalStore } from "react";
 import LoginModal from "@/components/LoginModal";
 import DemoFlowModal from "@/components/DemoFlowModal";
 import SourcesPanel from "@/components/SourcesPanel";
 import ChatPanel from "@/components/ChatPanel";
 import { UserInfo, authApi } from "@/lib/api";
 
+const AUTH_CHANGE_EVENT = "bili-auth-change";
+
+function readStoredAuth() {
+  if (typeof window === "undefined") return "";
+  const session = localStorage.getItem("bili_session");
+  const user = localStorage.getItem("bili_user");
+  return session && user ? JSON.stringify({ session, user }) : "";
+}
+
+function subscribeStoredAuth(callback: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener("storage", callback);
+  window.addEventListener(AUTH_CHANGE_EVENT, callback);
+  return () => {
+    window.removeEventListener("storage", callback);
+    window.removeEventListener(AUTH_CHANGE_EVENT, callback);
+  };
+}
+
+function notifyAuthChanged() {
+  window.dispatchEvent(new Event(AUTH_CHANGE_EVENT));
+}
+
 export default function Home() {
-  const [session, setSession] = useState<string | null>(null);
-  const [user, setUser] = useState<string | null>(null);
+  const authSnapshot = useSyncExternalStore(subscribeStoredAuth, readStoredAuth, () => "");
+  const auth = useMemo(() => {
+    if (!authSnapshot) return null;
+    try {
+      return JSON.parse(authSnapshot) as { session: string; user: string };
+    } catch {
+      return null;
+    }
+  }, [authSnapshot]);
   const [showLogin, setShowLogin] = useState(false);
   const [showDemo, setShowDemo] = useState(false);
   const [statsKey, setStatsKey] = useState(0);
@@ -55,29 +85,18 @@ export default function Home() {
     };
   }, [isDragging, handleMouseMove, handleMouseUp]);
 
-  useEffect(() => {
-    const s = localStorage.getItem("bili_session");
-    const u = localStorage.getItem("bili_user");
-    if (s && u) {
-      setSession(s);
-      setUser(u);
-    }
-  }, []);
-
   const onLogin = (sid: string, info: UserInfo) => {
-    setSession(sid);
-    setUser(info.uname);
     setShowLogin(false);
     localStorage.setItem("bili_session", sid);
     localStorage.setItem("bili_user", info.uname);
+    notifyAuthChanged();
   };
 
   const onLogout = () => {
-    if (session) authApi.logout(session).catch(() => { });
-    setSession(null);
-    setUser(null);
+    if (auth?.session) authApi.logout(auth.session).catch(() => { });
     localStorage.removeItem("bili_session");
     localStorage.removeItem("bili_user");
+    notifyAuthChanged();
   };
 
   return (
@@ -96,11 +115,11 @@ export default function Home() {
         </div>
 
         <div className="topbar-actions">
-          {user ? (
+          {auth?.user ? (
             <>
               <span className="user-chip">
                 <span>已登录</span>
-                <strong>{user}</strong>
+                <strong>{auth.user}</strong>
               </span>
               <button onClick={onLogout} className="btn-icon" title="退出">
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -117,11 +136,11 @@ export default function Home() {
       </header>
 
       <main className="app-main">
-        {!session ? (
+        {!auth?.session ? (
           <section className="hero">
             <div className="hero-content">
               <span className="hero-kicker">让你的B站收藏夹不再吃灰</span>
-              <h1 className="hero-title">把"收藏"变成真正可用的知识</h1>
+              <h1 className="hero-title">把“收藏”变成真正可用的知识</h1>
               <p className="hero-desc">
                 很多人收藏了大量学习视频，却迟迟没看、没整理、也找不到重点。<br />
                 这里把碎片化内容接入 AI：自动提炼、语义检索、对话式回顾，让收藏真正提升效率。
@@ -160,7 +179,7 @@ export default function Home() {
           <section className="workspace" ref={containerRef}>
             <aside className="panel panel-sources" style={{ width: leftWidth, flexShrink: 0 }}>
               <SourcesPanel
-                sessionId={session}
+                sessionId={auth.session}
                 onBuildDone={() => setStatsKey((v) => v + 1)}
                 onSelectionChange={setSelectedFolderIds}
               />
@@ -176,7 +195,7 @@ export default function Home() {
             <section className="panel panel-chat" style={{ flex: 1 }}>
               <ChatPanel
                 statsKey={statsKey}
-                sessionId={session ?? undefined}
+                sessionId={auth.session}
                 folderIds={selectedFolderIds}
               />
             </section>

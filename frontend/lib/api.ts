@@ -120,6 +120,11 @@ export interface BuildStatus {
     current_step: string;
     total_videos: number;
     processed_videos: number;
+    total_folders?: number;
+    processed_folders?: number;
+    current_folder_id?: number;
+    current_folder_title?: string;
+    current_video_title?: string;
     message: string;
 }
 

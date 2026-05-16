@@ -112,7 +112,7 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
           // 忽略解析错误，避免影响主文本
         }
       }
-    } catch (e) {
+    } catch {
       try {
         const res = await chatApi.ask(q, sessionId, folderIds);
         setMessages((prev) =>

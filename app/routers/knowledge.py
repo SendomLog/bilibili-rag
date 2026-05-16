@@ -50,6 +50,11 @@ class BuildStatus(BaseModel):
     current_step: str
     total_videos: int
     processed_videos: int
+    total_folders: Optional[int] = None
+    processed_folders: Optional[int] = None
+    current_folder_id: Optional[int] = None
+    current_folder_title: Optional[str] = None
+    current_video_title: Optional[str] = None
     message: str
 
 
@@ -165,7 +170,7 @@ async def _sync_folder(
     session_id: str,
     folder_id: int,
     exclude_bvids: Optional[set[str]] = None,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
 ) -> dict:
     """同步单个收藏夹到向量库"""
     info = {}
@@ -596,6 +601,11 @@ async def build_knowledge_base(
         "current_step": "初始化中...",
         "total_videos": 0,
         "processed_videos": 0,
+        "total_folders": len(request.folder_ids),
+        "processed_folders": 0,
+        "current_folder_id": None,
+        "current_folder_title": None,
+        "current_video_title": None,
         "message": "",
     }
 
@@ -636,29 +646,37 @@ async def _build_knowledge_base_task(
 
         try:
             total_folders = len(folder_ids)
+            build_tasks[task_id]["total_folders"] = total_folders
             if total_folders == 0:
                 build_tasks[task_id]["status"] = "completed"
                 build_tasks[task_id]["progress"] = 100
                 build_tasks[task_id]["message"] = "没有需要处理的收藏夹"
                 return
 
-            processed = 0
             total_added = 0
             total_removed = 0
 
             async with get_db_context() as db:
                 for idx, folder_id in enumerate(folder_ids, start=1):
                     build_tasks[task_id]["current_step"] = f"同步收藏夹 {folder_id}"
+                    build_tasks[task_id]["current_folder_id"] = folder_id
+                    build_tasks[task_id]["current_folder_title"] = f"收藏夹 {folder_id}"
+                    build_tasks[task_id]["current_video_title"] = None
+                    build_tasks[task_id]["processed_folders"] = idx - 1
+                    build_tasks[task_id]["processed_videos"] = 0
+                    build_tasks[task_id]["total_videos"] = 0
 
                     def progress_cb(title: str, processed_count: int = 0, total_count: int = 0):
                         build_tasks[task_id]["current_step"] = f"处理: {title}"
+                        build_tasks[task_id]["current_video_title"] = title
                         if total_count:
                             build_tasks[task_id]["total_videos"] = total_count
-                        if processed_count:
+                        if processed_count or processed_count == 0:
                             build_tasks[task_id]["processed_videos"] = processed_count
                             if build_tasks[task_id]["total_videos"]:
+                                folder_progress = processed_count / build_tasks[task_id]["total_videos"]
                                 build_tasks[task_id]["progress"] = int(
-                                    (processed_count / build_tasks[task_id]["total_videos"]) * 100
+                                    ((idx - 1 + folder_progress) / total_folders) * 100
                                 )
 
                     result = await _sync_folder(
@@ -672,14 +690,17 @@ async def _build_knowledge_base_task(
                         progress_callback=progress_cb,
                     )
 
-                    processed = idx
+                    build_tasks[task_id]["processed_folders"] = idx
                     total_added += result["added"]
                     total_removed += result["removed"]
 
             build_tasks[task_id]["status"] = "completed"
             build_tasks[task_id]["progress"] = 100
-            build_tasks[task_id]["processed_videos"] = total_folders
+            build_tasks[task_id]["processed_folders"] = total_folders
             build_tasks[task_id]["current_step"] = "完成"
+            build_tasks[task_id]["current_folder_id"] = None
+            build_tasks[task_id]["current_folder_title"] = None
+            build_tasks[task_id]["current_video_title"] = None
             build_tasks[task_id]["message"] = f"同步完成：新增 {total_added}，移除 {total_removed}"
 
             logger.info(f"知识库构建完成: 新增 {total_added}，移除 {total_removed}")
@@ -706,6 +727,11 @@ async def get_build_status(task_id: str):
         current_step=task["current_step"],
         total_videos=task["total_videos"],
         processed_videos=task["processed_videos"],
+        total_folders=task.get("total_folders"),
+        processed_folders=task.get("processed_folders"),
+        current_folder_id=task.get("current_folder_id"),
+        current_folder_title=task.get("current_folder_title"),
+        current_video_title=task.get("current_video_title"),
         message=task["message"],
     )
 
