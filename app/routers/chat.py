@@ -238,6 +238,23 @@ def _filter_docs_by_keywords(docs: List[Document], question: str) -> List[Docume
             filtered.append(doc)
     return filtered
 
+def _rank_sources_by_question(sources: List[dict], question: str) -> List[dict]:
+    """让总结类回答的来源优先指向标题命中的视频。"""
+    keywords = _extract_keywords(question)
+    if not keywords:
+        return sources
+    ranked = []
+    for index, source in enumerate(sources):
+        score = keyword_score(keywords, title=source.get("title", "") or "")
+        if score > 0:
+            ranked.append((score, index, source))
+    if not ranked:
+        return sources
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    best_score = ranked[0][0]
+    ranked = [item for item in ranked if item[0] >= best_score * 0.5]
+    return [source for _, _, source in ranked]
+
 def _build_keyword_document(
     *,
     bvid: str,
@@ -562,6 +579,7 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         context, sources = await _get_video_context(db, folder_ids, include_content=True, limit=None)
         if not context:
             return _build_fallback_messages("（暂无信息，请入库）", question), sources, question
+        sources = _rank_sources_by_question(sources, question)
         return _build_db_summary_messages(context, question), sources, question
     # 6) 检查相关性。vector 路由本身就是语义检索意图，不再用关键词 LIKE 提前拦截。
     if route != "vector":
