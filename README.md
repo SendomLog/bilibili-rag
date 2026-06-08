@@ -70,6 +70,7 @@ RETRIEVAL_MMR_LAMBDA=0.55
 注意：
 - `.env` 必须放在项目根目录，不是 `frontend/` 目录
 - `OPENAI_BASE_URL` 用于 LLM 对话，推荐使用 `https://dashscope.aliyuncs.com/compatible-mode/v1`
+- `DASHSCOPE_API_KEY` 用于 DashScope ASR 和 Embedding；Embedding 通过 DashScope SDK 调用，不使用 `OPENAI_BASE_URL`
 - `DASHSCOPE_BASE_URL` 只用于 ASR，不要和 `OPENAI_BASE_URL` 混用
 - `CHAT_USE_LLM_ROUTER=false` 会跳过每次回答前的额外路由模型调用，首字更快；如需更智能的自动路由可改为 `true`
 - 召回参数通常保持默认即可；如果库很大且想要更高召回，可适当增大 `RETRIEVAL_CANDIDATE_K`
@@ -205,6 +206,10 @@ A：后端没有读到有效 API Key。请检查 `.env` 是否在项目根目录
 
 **Q：百炼 / DashScope 的 `OPENAI_BASE_URL` 应该填什么？**  
 A：推荐填 `https://dashscope.aliyuncs.com/compatible-mode/v1`。不要填 `https://coding.dashscope.aliyuncs.com/v1`，也不要把 ASR 的 `DASHSCOPE_BASE_URL` 填到这里。
+
+**Q：报错 `DashScope Embedding 初始化失败` 是什么原因？**
+
+A：后端缺少 Embedding 所需依赖。请运行 `pip install -r requirements.txt` 后重启后端。Embedding 使用 DashScope SDK，不会自动切换到 `OPENAI_BASE_URL`。
 
 **Q：报错 `AllocationQuota.FreeTierOnly` 是什么原因？**  
 A：这是上游模型服务返回的配额错误，通常表示免费额度已耗尽，或控制台开启了“仅使用免费额度”。这不是本项目代码错误，需要在模型服务控制台调整额度/付费设置，或切换可用模型。

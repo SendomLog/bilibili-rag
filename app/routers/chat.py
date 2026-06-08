@@ -612,7 +612,8 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
             f"混合检索完成：vector={len(vector_docs)} keyword={len(keyword_docs)} final={len(docs)}，耗时={time.perf_counter() - recall_started:.2f}s"
         )
     except Exception as e:
-        logger.warning(f"混合检索失败: {e}")
+        logger.error(f"混合检索失败: {e}")
+        raise RuntimeError("知识库检索失败") from e
     if docs:
         context_parts, sources, seen_bvids = [], [], set()
         for doc in docs:

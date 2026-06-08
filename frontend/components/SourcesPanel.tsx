@@ -207,6 +207,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
   const getFolderStatus = (mediaId: number, totalInBilibili: number) => {
     const status = statusMap[mediaId];
     const indexedCount = status?.indexed_count ?? 0;
+    const failedCount = status?.failed_count ?? 0;
     const lastSync = status?.last_sync_at;
     const folder = folders.find((f) => f.media_id === mediaId);
     const countSource = folder?.count_source ?? "bili";
@@ -222,6 +223,11 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
       return { label: "未入库", className: "empty", indexedCount };
     }
 
+    if (failedCount > 0) {
+      const label = indexedCount > 0 ? "部分入库失败" : "入库失败";
+      return { label, className: "partial", indexedCount, totalCount };
+    }
+
     // 已入库：有同步时间
     if (indexedCount >= totalCount) {
       return { label: "已入库", className: "ok", indexedCount, totalCount };
@@ -232,7 +238,11 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
       return { label: "有更新", className: "partial", indexedCount, totalCount };
     }
 
-    // 已入库但视频数为0（可能视频都没有内容）
+    if (totalCount > 0 && indexedCount === 0) {
+      return { label: "入库失败", className: "partial", indexedCount, totalCount };
+    }
+
+    // 空收藏夹已完成同步
     return { label: "已入库", className: "ok", indexedCount, totalCount };
   };
 

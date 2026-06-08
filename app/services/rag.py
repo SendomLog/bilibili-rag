@@ -5,7 +5,7 @@ RAG 服务模块 - 向量存储与问答
 """
 from typing import List, Optional
 from loguru import logger
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
@@ -38,18 +38,17 @@ class RAGService:
         # 初始化 Embeddings (使用 DashScope 原生支持)
         try:
             from langchain_community.embeddings import DashScopeEmbeddings
-            self.embeddings = DashScopeEmbeddings(
-                dashscope_api_key=settings.openai_api_key,
-                model=settings.embedding_model
-            )
-            logger.info("使用 DashScopeEmbeddings 初始化成功")
-        except ImportError:
-            self.embeddings = OpenAIEmbeddings(
-                api_key=settings.openai_api_key,
-                base_url=settings.openai_base_url,
-                model=settings.embedding_model,
-                check_embedding_ctx_length=False
-            )
+        except ImportError as exc:
+            logger.error("缺少 langchain-community，无法初始化 DashScope Embedding")
+            raise RuntimeError(
+                "DashScope Embedding 初始化失败，请运行 pip install -r requirements.txt"
+            ) from exc
+
+        self.embeddings = DashScopeEmbeddings(
+            dashscope_api_key=settings.openai_api_key,
+            model=settings.embedding_model
+        )
+        logger.info("使用 DashScopeEmbeddings 初始化成功")
         
         # 初始化向量存储
         self.vectorstore = Chroma(
@@ -222,13 +221,20 @@ class RAGService:
             documents.append(doc)
         
         # 添加到向量库
+        added_ids: List[str] = []
         try:
             batch_size = 10
             for idx in range(0, len(documents), batch_size):
-                self.vectorstore.add_documents(documents[idx:idx + batch_size])
+                added_ids.extend(self.vectorstore.add_documents(documents[idx:idx + batch_size]))
             logger.info(f"[{video.bvid}] 添加了 {len(documents)} 个文档块")
         except Exception as e:
             logger.error(f"[{video.bvid}] 添加到向量库失败: {e}")
+            if added_ids:
+                try:
+                    self.vectorstore._collection.delete(ids=added_ids)
+                    logger.warning(f"[{video.bvid}] 已清理 {len(added_ids)} 个未完成向量")
+                except Exception as cleanup_error:
+                    logger.error(f"[{video.bvid}] 清理未完成向量失败: {cleanup_error}")
             raise
         
         return len(documents)
@@ -317,8 +323,8 @@ class RAGService:
 
             return docs
         except Exception as e:
-            logger.warning(f"向量检索失败: {e}")
-            return []
+            logger.error(f"向量检索失败: {e}")
+            raise RuntimeError("向量检索失败") from e
     
     async def _fallback_answer(self, question: str, reason: str = "") -> dict:
         """
@@ -382,7 +388,7 @@ class RAGService:
             )
         except Exception as e:
             logger.error(f"检索失败: {e}")
-            return await self._fallback_answer(question, f"检索时遇到问题")
+            raise
         
         if not docs:
             # 没检索到内容时，也让 AI 自然回复
@@ -502,6 +508,15 @@ class RAGService:
                 "collection_name": self.collection_name
             }
     
+    def has_video(self, bvid: str) -> bool:
+        """检查指定视频是否实际存在于向量库。"""
+        try:
+            result = self.vectorstore._collection.get(where={"bvid": bvid}, limit=1)
+            return bool(result.get("ids"))
+        except Exception as e:
+            logger.error(f"查询视频向量失败 [{bvid}]: {e}")
+            raise RuntimeError(f"查询视频向量失败 [{bvid}]") from e
+
     def clear_collection(self):
         """清空向量库"""
         try:

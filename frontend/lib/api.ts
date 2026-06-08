@@ -131,6 +131,7 @@ export interface BuildStatus {
 export interface FolderStatus {
     media_id: number;
     indexed_count: number;
+    failed_count: number;
     media_count?: number;
     last_sync_at?: string;
 }
@@ -145,6 +146,7 @@ export interface SyncResult {
     added: number;
     removed: number;
     indexed: number;
+    failed: number;
     message: string;
     last_sync_at: string;
 }

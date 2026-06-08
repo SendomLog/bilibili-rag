@@ -62,6 +62,7 @@ class FolderStatus(BaseModel):
     """收藏夹入库状态"""
     media_id: int
     indexed_count: int
+    failed_count: int = 0
     media_count: Optional[int] = None
     last_sync_at: Optional[datetime] = None
 
@@ -78,6 +79,7 @@ class SyncResult(BaseModel):
     added: int
     removed: int
     indexed: int
+    failed: int = 0
     message: str
     last_sync_at: Optional[datetime] = None
 
@@ -162,6 +164,14 @@ async def _upsert_video_cache(db: AsyncSession, bvid: str, meta: dict) -> None:
         cache.pic_url = meta.get("cover")
 
 
+def _set_cache_processing_result(cache: Optional[VideoCache], error: Optional[Exception] = None) -> None:
+    """记录内容是否已成功写入向量库。"""
+    if cache is None:
+        return
+    cache.is_processed = error is None
+    cache.process_error = str(error) if error else None
+
+
 async def _sync_folder(
     db: AsyncSession,
     bili: BilibiliService,
@@ -186,20 +196,9 @@ async def _sync_folder(
     # 保护：接口异常返回空列表时，避免误删
     if not videos:
         if total_in_folder and total_in_folder > 0:
-            logger.warning(f"[{folder_id}] 收藏夹返回空列表，跳过删除逻辑")
-            existing_count = await db.scalar(
-                select(func.count(FavoriteVideo.bvid))
-                .where(FavoriteVideo.folder_id == folder_id)
+            raise RuntimeError(
+                f"收藏夹 {folder_id} 返回空列表，已中止同步以避免误删"
             )
-            return {
-                "folder_id": folder_id,
-                "total": total_in_folder,
-                "added": 0,
-                "removed": 0,
-                "indexed": existing_count or 0,
-                "message": "本次同步异常：空列表，已跳过",
-                "last_sync_at": datetime.utcnow(),
-            }
 
     video_map = {}
     skipped_invalid = 0
@@ -286,24 +285,31 @@ async def _sync_folder(
 
     # 需要更新的已存在视频（缓存过少或来源较弱）
     update_candidates: set[str] = set()
+    vector_presence: dict[str, bool] = {}
     for bvid in current_bvids & existing_bvids:
         if bvid in added:
             continue
         result = await db.execute(select(VideoCache).where(VideoCache.bvid == bvid))
         cache = result.scalar_one_or_none()
-        if _should_refresh_cache(cache):
+        has_vectors = rag.has_video(bvid)
+        vector_presence[bvid] = has_vectors
+        if cache and cache.is_processed and not has_vectors:
+            _set_cache_processing_result(cache, RuntimeError("向量数据缺失，等待重新入库"))
+        if _should_refresh_cache(cache) or cache is None or not cache.is_processed or not has_vectors:
             update_candidates.add(bvid)
 
     # 新增/更新向量与关联
     targets = list(added) + list(update_candidates)
     total_targets = len(targets)
     processed_targets = 0
+    failed_targets = 0
     if progress_callback:
         progress_callback("准备处理", processed_targets, total_targets)
     for bvid in targets:
         meta = video_map[bvid]
+        cache = None
         
-        # 尝试添加到向量库（可能失败，但不影响记录入库）
+        # 收藏关系与向量状态分开保存，失败的视频可在下次同步时重试。
         try:
             global_count = await db.scalar(
                 select(func.count()).select_from(FavoriteVideo).where(FavoriteVideo.bvid == bvid)
@@ -313,6 +319,9 @@ async def _sync_folder(
             cache = result.scalar_one_or_none()
             old_content = (cache.content or "").strip() if cache else ""
             old_source = cache.content_source if cache else None
+            has_vectors = vector_presence.get(bvid)
+            if has_vectors is None:
+                has_vectors = rag.has_video(bvid)
 
             needs_fetch = _should_refresh_cache(cache)
             content = None
@@ -346,11 +355,10 @@ async def _sync_folder(
                     cache.content = content.content
                     cache.content_source = content.source.value
                     cache.outline_json = content.outline
-                    cache.is_processed = True
                     logger.info(f"[{bvid}] 已写入缓存: source={cache.content_source}")
 
             # 需要重建向量：新增/升级/内容变化 或 向量缺失
-            if (global_count == 0) or should_reindex:
+            if (global_count == 0) or should_reindex or cache is None or not cache.is_processed or not has_vectors:
                 if not content:
                     if _is_asr_cache_usable(cache):
                         content = VideoContent(
@@ -364,7 +372,6 @@ async def _sync_folder(
                             owner_mid=meta.get("owner_mid"),
                             duration=meta.get("duration"),
                         )
-                        cache.is_processed = True
                         logger.info(f"[{bvid}] 使用缓存 ASR 内容重建向量")
                     else:
                         content = await content_fetcher.fetch_content(
@@ -380,18 +387,22 @@ async def _sync_folder(
                             cache.content = content.content
                             cache.content_source = content.source.value
                             cache.outline_json = content.outline
-                            cache.is_processed = True
                             logger.info(f"[{bvid}] 已写入缓存: source={cache.content_source}")
                 try:
                     rag.delete_video(bvid)
                 except Exception as e:
                     logger.warning(f"删除旧向量失败 [{bvid}]: {e}")
                 chunks = rag.add_video_content(content)
+                if chunks <= 0:
+                    raise RuntimeError("未生成可写入的向量文档")
+                _set_cache_processing_result(cache)
                 logger.info(f"[{bvid}] 向量化完成，块数={chunks}")
             else:
                 logger.info(f"[{bvid}] 内容未变化或无需升级，跳过向量化")
         except Exception as e:
-            logger.warning(f"添加向量失败 [{bvid}]: {e} (仍会记录到数据库)")
+            failed_targets += 1
+            _set_cache_processing_result(cache, e)
+            logger.error(f"添加向量失败 [{bvid}]: {e} (收藏关系已保存，可重试)")
         
         # 无论向量是否添加成功，都写入 FavoriteVideo 记录
         try:
@@ -440,8 +451,16 @@ async def _sync_folder(
     indexed_count = await db.scalar(
         select(func.count(func.distinct(FavoriteVideo.bvid)))
         .select_from(FavoriteVideo)
-        .where(FavoriteVideo.folder_id == folder.id)
+        .join(VideoCache, VideoCache.bvid == FavoriteVideo.bvid)
+        .where(
+            FavoriteVideo.folder_id == folder.id,
+            VideoCache.is_processed.is_(True),
+        )
     )
+
+    message = "同步完成"
+    if failed_targets:
+        message = f"同步未完成：{failed_targets} 个视频向量入库失败，可重新更新"
 
     return {
         "folder_id": folder_id,
@@ -449,7 +468,8 @@ async def _sync_folder(
         "added": len(added),
         "removed": len(removed),
         "indexed": indexed_count or 0,
-        "message": "同步完成",
+        "failed": failed_targets,
+        "message": message,
         "last_sync_at": folder.last_sync_at,
     }
 
@@ -508,13 +528,32 @@ async def get_folder_status(
 
     folder_ids = [v[0] for v in folders_map.values()]
     
-    # 4. 统计视频数量
-    counts = await db.execute(
-        select(FavoriteVideo.folder_id, func.count(func.distinct(FavoriteVideo.bvid)))
+    # 4. 按 Chroma 实际数据校准并统计入库状态
+    relations = await db.execute(
+        select(FavoriteVideo.folder_id, FavoriteVideo.bvid, VideoCache)
+        .join(VideoCache, VideoCache.bvid == FavoriteVideo.bvid)
         .where(FavoriteVideo.folder_id.in_(folder_ids))
-        .group_by(FavoriteVideo.folder_id)
     )
-    count_map = {row[0]: row[1] for row in counts.fetchall()}
+    rag = get_rag_service()
+    vector_presence: dict[str, bool] = {}
+    indexed_map: dict[int, int] = {}
+    failed_map: dict[int, int] = {}
+    state_changed = False
+    for folder_id, bvid, cache in relations.fetchall():
+        has_vectors = vector_presence.get(bvid)
+        if has_vectors is None:
+            has_vectors = rag.has_video(bvid)
+            vector_presence[bvid] = has_vectors
+        if not has_vectors and (cache.is_processed or not cache.process_error):
+            _set_cache_processing_result(cache, RuntimeError("向量数据缺失，等待重新入库"))
+            state_changed = True
+        if has_vectors and cache.is_processed:
+            indexed_map[folder_id] = indexed_map.get(folder_id, 0) + 1
+        if cache.process_error:
+            failed_map[folder_id] = failed_map.get(folder_id, 0) + 1
+
+    if state_changed:
+        await db.commit()
 
     result = []
     for media_id, (folder_id, last_sync_at) in folders_map.items():
@@ -526,7 +565,8 @@ async def get_folder_status(
         result.append(
             FolderStatus(
                 media_id=media_id,
-                indexed_count=count_map.get(folder_id, 0),
+                indexed_count=indexed_map.get(folder_id, 0),
+                failed_count=failed_map.get(folder_id, 0),
                 media_count=media_count,
                 last_sync_at=last_sync_at,
             )
@@ -587,6 +627,7 @@ async def sync_folders(
                         added=0,
                         removed=0,
                         indexed=0,
+                        failed=1,
                         message=f"同步失败: {e}",
                         last_sync_at=None,
                     )
@@ -671,6 +712,7 @@ async def _build_knowledge_base_task(
 
             total_added = 0
             total_removed = 0
+            total_failed = 0
 
             async with get_db_context() as db:
                 for idx, folder_id in enumerate(folder_ids, start=1):
@@ -709,17 +751,21 @@ async def _build_knowledge_base_task(
                     build_tasks[task_id]["processed_folders"] = idx
                     total_added += result["added"]
                     total_removed += result["removed"]
+                    total_failed += result.get("failed", 0)
 
-            build_tasks[task_id]["status"] = "completed"
+            build_tasks[task_id]["status"] = "failed" if total_failed else "completed"
             build_tasks[task_id]["progress"] = 100
             build_tasks[task_id]["processed_folders"] = total_folders
-            build_tasks[task_id]["current_step"] = "完成"
+            build_tasks[task_id]["current_step"] = "失败" if total_failed else "完成"
             build_tasks[task_id]["current_folder_id"] = None
             build_tasks[task_id]["current_folder_title"] = None
             build_tasks[task_id]["current_video_title"] = None
-            build_tasks[task_id]["message"] = f"同步完成：新增 {total_added}，移除 {total_removed}"
+            if total_failed:
+                build_tasks[task_id]["message"] = f"同步未完成：{total_failed} 个视频向量入库失败，可重新更新"
+            else:
+                build_tasks[task_id]["message"] = f"同步完成：新增 {total_added}，移除 {total_removed}"
 
-            logger.info(f"知识库构建完成: 新增 {total_added}，移除 {total_removed}")
+            logger.info(f"知识库构建结束: 新增 {total_added}，移除 {total_removed}，失败 {total_failed}")
         finally:
             await bili.close()
 
