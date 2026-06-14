@@ -3,7 +3,7 @@ Bilibili RAG 知识库系统
 
 RAG 服务模块 - 向量存储与问答
 """
-from typing import List, Optional
+from typing import Callable, List, Optional
 from loguru import logger
 from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
@@ -14,6 +14,7 @@ from langchain.schema.runnable import RunnablePassthrough
 from langchain.schema.output_parser import StrOutputParser
 from app.config import settings
 from app.models import VideoContent
+from app.services.cancellation import OperationCancelled, ensure_not_cancelled
 
 
 class RAGService:
@@ -150,7 +151,11 @@ class RAGService:
             },
         )
     
-    def add_video_content(self, video: VideoContent) -> int:
+    def add_video_content(
+        self,
+        video: VideoContent,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> int:
         """
         添加单个视频内容到向量库
         
@@ -225,8 +230,17 @@ class RAGService:
         try:
             batch_size = 10
             for idx in range(0, len(documents), batch_size):
+                ensure_not_cancelled(cancel_check)
                 added_ids.extend(self.vectorstore.add_documents(documents[idx:idx + batch_size]))
+                ensure_not_cancelled(cancel_check)
             logger.info(f"[{video.bvid}] 添加了 {len(documents)} 个文档块")
+        except OperationCancelled:
+            if added_ids:
+                try:
+                    self.vectorstore._collection.delete(ids=added_ids)
+                except Exception as cleanup_error:
+                    logger.error(f"[{video.bvid}] 取消后清理向量失败: {cleanup_error}")
+            raise
         except Exception as e:
             logger.error(f"[{video.bvid}] 添加到向量库失败: {e}")
             if added_ids:

@@ -3,10 +3,11 @@ Bilibili RAG 知识库系统
 
 知识库路由 - 构建和管理知识库
 """
+import asyncio
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Depends, Response
 from loguru import logger
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Literal
 from pydantic import BaseModel
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +18,8 @@ from app.services.bilibili import BilibiliService
 from app.services.content_fetcher import ContentFetcher
 from app.services.asr import ASRService
 from app.services.rag import RAGService
+from app.services.markdown_export import build_video_markdown, organize_video_content
+from app.services.cancellation import CancelCheck, OperationCancelled, ensure_not_cancelled
 from app.routers.auth import get_session
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
@@ -26,6 +29,9 @@ _rag_service: Optional[RAGService] = None
 
 # 构建任务状态
 build_tasks = {}
+
+# 单视频导出/入库操作取消状态
+active_operations: dict[str, tuple[str, asyncio.Event]] = {}
 
 
 def get_rag_service() -> RAGService:
@@ -82,6 +88,51 @@ class SyncResult(BaseModel):
     failed: int = 0
     message: str
     last_sync_at: Optional[datetime] = None
+
+
+class MarkdownExportRequest(BaseModel):
+    """视频 Markdown 导出请求"""
+    mode: Literal["original", "ai"] = "original"
+    operation_id: Optional[str] = None
+
+
+class SingleVideoIngestRequest(BaseModel):
+    """单视频入库请求"""
+    folder_id: int
+    operation_id: Optional[str] = None
+
+
+def _start_operation(operation_id: Optional[str], session_id: str) -> Optional[asyncio.Event]:
+    if not operation_id:
+        return None
+    existing = active_operations.get(operation_id)
+    if existing:
+        raise HTTPException(status_code=409, detail="操作标识已被占用")
+    event = asyncio.Event()
+    active_operations[operation_id] = (session_id, event)
+    return event
+
+
+def _finish_operation(operation_id: Optional[str], session_id: str) -> None:
+    if not operation_id:
+        return
+    existing = active_operations.get(operation_id)
+    if existing and existing[0] == session_id:
+        active_operations.pop(operation_id, None)
+
+
+async def _get_session_ids_for_user(db: AsyncSession, session_id: str) -> List[str]:
+    """获取当前 Session 及同一 B 站账号的历史 Session。"""
+    mid = await db.scalar(
+        select(UserSession.bili_mid).where(UserSession.session_id == session_id)
+    )
+    if not mid:
+        return [session_id]
+    rows = await db.execute(
+        select(UserSession.session_id).where(UserSession.bili_mid == mid)
+    )
+    session_ids = [row[0] for row in rows.fetchall()]
+    return session_ids or [session_id]
 
 
 async def _get_or_create_folder(
@@ -162,6 +213,108 @@ async def _upsert_video_cache(db: AsyncSession, bvid: str, meta: dict) -> None:
         cache.duration = meta.get("duration")
     if meta.get("cover") is not None:
         cache.pic_url = meta.get("cover")
+
+
+async def _ingest_single_video(
+    db: AsyncSession,
+    bili: BilibiliService,
+    rag: RAGService,
+    content_fetcher: ContentFetcher,
+    session_id: str,
+    folder_id: int,
+    bvid: str,
+    cancel_check: CancelCheck = None,
+) -> VideoCache:
+    """验证收藏关系并将单个视频写入缓存与向量库。"""
+    ensure_not_cancelled(cancel_check)
+    info_result = await bili.get_favorite_content(folder_id, pn=1, ps=1)
+    ensure_not_cancelled(cancel_check)
+    folder_info = info_result.get("info", {})
+    videos = await bili.get_all_favorite_videos(folder_id)
+    ensure_not_cancelled(cancel_check)
+    media = next((item for item in videos if (item.get("bvid") or item.get("bv_id")) == bvid), None)
+    if media is None:
+        raise HTTPException(status_code=404, detail="该视频不在指定收藏夹中")
+
+    title = media.get("title", bvid)
+    if media.get("attr", 0) == 9 or title in ["已失效视频", "已删除视频"]:
+        raise HTTPException(status_code=409, detail="视频已失效，无法入库")
+
+    _, title, cid = _extract_video_info(media)
+    owner = media.get("upper") or {}
+    meta = {
+        "title": title,
+        "cid": cid,
+        "intro": media.get("intro"),
+        "cover": media.get("cover"),
+        "duration": media.get("duration"),
+        "owner_name": owner.get("name"),
+        "owner_mid": owner.get("mid"),
+    }
+    folder = await _get_or_create_folder(
+        db,
+        session_id=session_id,
+        media_id=folder_id,
+        title=folder_info.get("title"),
+        media_count=folder_info.get("media_count", len(videos)),
+    )
+    ensure_not_cancelled(cancel_check)
+    await _upsert_video_cache(db, bvid, meta)
+    cache = await db.scalar(select(VideoCache).where(VideoCache.bvid == bvid))
+    if cache is None:
+        raise RuntimeError("写入视频缓存失败")
+
+    relation = await db.scalar(
+        select(FavoriteVideo.id).where(
+            FavoriteVideo.folder_id == folder.id,
+            FavoriteVideo.bvid == bvid,
+        )
+    )
+    if relation is None:
+        db.add(FavoriteVideo(folder_id=folder.id, bvid=bvid, is_selected=True))
+
+    try:
+        ensure_not_cancelled(cancel_check)
+        has_vectors = await asyncio.to_thread(rag.has_video, bvid)
+        ensure_not_cancelled(cancel_check)
+        if not (cache.content or "").strip() or not cache.is_processed or not has_vectors:
+            content = await content_fetcher.fetch_content(
+                bvid,
+                cid=meta["cid"],
+                title=meta["title"],
+                description=meta.get("intro"),
+                owner_name=meta.get("owner_name"),
+                owner_mid=meta.get("owner_mid"),
+                duration=meta.get("duration"),
+            )
+            ensure_not_cancelled(cancel_check)
+            cache.content = content.content
+            cache.content_source = content.source.value
+            cache.outline_json = content.outline
+            if has_vectors:
+                await asyncio.to_thread(rag.delete_video, bvid)
+                ensure_not_cancelled(cancel_check)
+            chunks = await asyncio.to_thread(
+                rag.add_video_content,
+                content,
+                cancel_check,
+            )
+            ensure_not_cancelled(cancel_check)
+            if chunks <= 0:
+                raise RuntimeError("未生成可写入的向量文档")
+            _set_cache_processing_result(cache)
+
+        folder.last_sync_at = datetime.utcnow()
+        ensure_not_cancelled(cancel_check)
+        await db.commit()
+        return cache
+    except OperationCancelled:
+        await db.rollback()
+        raise
+    except Exception as e:
+        _set_cache_processing_result(cache, e)
+        await db.commit()
+        raise
 
 
 def _set_cache_processing_result(cache: Optional[VideoCache], error: Optional[Exception] = None) -> None:
@@ -820,3 +973,133 @@ async def delete_video_from_knowledge(bvid: str):
     except Exception as e:
         logger.error(f"删除视频失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/video/{bvid}/export")
+async def export_video_markdown(
+    bvid: str,
+    payload: MarkdownExportRequest,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """导出当前用户已入库视频的 Markdown 内容。"""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+    target_session_ids = await _get_session_ids_for_user(db, session_id)
+    result = await db.execute(
+        select(VideoCache)
+        .join(FavoriteVideo, FavoriteVideo.bvid == VideoCache.bvid)
+        .join(FavoriteFolder, FavoriteFolder.id == FavoriteVideo.folder_id)
+        .where(
+            VideoCache.bvid == bvid,
+            FavoriteFolder.session_id.in_(target_session_ids),
+        )
+        .limit(1)
+    )
+    video = result.scalar_one_or_none()
+    if video is None:
+        raise HTTPException(status_code=404, detail="视频尚未入库或不属于当前会话")
+    if not (video.content or "").strip():
+        raise HTTPException(status_code=409, detail="视频尚无可导出的字幕或转写内容")
+
+    cancel_event = _start_operation(payload.operation_id, session_id)
+    cancel_check = cancel_event.is_set if cancel_event else None
+    try:
+        ensure_not_cancelled(cancel_check)
+        ai_content = None
+        if payload.mode == "ai":
+            ai_content = await asyncio.to_thread(
+                organize_video_content,
+                video.title,
+                video.content,
+                cancel_check=cancel_check,
+            )
+        ensure_not_cancelled(cancel_check)
+        markdown = build_video_markdown(video, ai_content=ai_content)
+        return Response(
+            content=markdown,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{bvid}.md"'},
+        )
+    except OperationCancelled:
+        logger.info(f"视频 Markdown 导出已取消 [{bvid}]")
+        raise HTTPException(status_code=409, detail="操作已取消")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"导出视频 Markdown 失败 [{bvid}]: {e}")
+        raise HTTPException(status_code=500, detail=f"导出失败: {e}")
+    finally:
+        _finish_operation(payload.operation_id, session_id)
+
+
+@router.post("/video/{bvid}/ingest")
+async def ingest_single_video(
+    bvid: str,
+    payload: SingleVideoIngestRequest,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """将当前用户收藏夹中的单个视频写入知识库。"""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+    cookies = session.get("cookies", {})
+    bili = BilibiliService(
+        sessdata=cookies.get("SESSDATA"),
+        bili_jct=cookies.get("bili_jct"),
+        dedeuserid=cookies.get("DedeUserID"),
+    )
+    cancel_event = _start_operation(payload.operation_id, session_id)
+    cancel_check = cancel_event.is_set if cancel_event else None
+    try:
+        asr_service = ASRService(cancel_check=cancel_check)
+        content_fetcher = ContentFetcher(bili, asr_service, cancel_check=cancel_check)
+        cache = await _ingest_single_video(
+            db,
+            bili,
+            get_rag_service(),
+            content_fetcher,
+            session_id,
+            payload.folder_id,
+            bvid,
+            cancel_check,
+        )
+        return {
+            "bvid": cache.bvid,
+            "title": cache.title,
+            "message": "单视频入库完成",
+        }
+    except OperationCancelled:
+        await db.rollback()
+        logger.info(f"单视频入库已取消 [{bvid}]")
+        raise HTTPException(status_code=409, detail="操作已取消")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"单视频入库失败 [{bvid}]: {e}")
+        raise HTTPException(status_code=500, detail=f"单视频入库失败: {e}")
+    finally:
+        _finish_operation(payload.operation_id, session_id)
+        await bili.close()
+
+
+@router.post("/operations/{operation_id}/cancel")
+async def cancel_operation(
+    operation_id: str,
+    session_id: str = Query(..., description="会话ID"),
+):
+    """取消单视频导出或入库操作。"""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+    operation = active_operations.get(operation_id)
+    if operation and operation[0] == session_id:
+        operation[1].set()
+        logger.info(f"收到操作取消请求 [{operation_id}]")
+        return {"message": "取消请求已发送"}
+    return {"message": "操作已结束或不存在"}

@@ -4,6 +4,13 @@
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+export class ApiError extends Error {
+    constructor(public status: number, message: string) {
+        super(message);
+        this.name = "ApiError";
+    }
+}
+
 // 通用请求函数
 async function request<T>(
     endpoint: string,
@@ -31,10 +38,40 @@ async function request<T>(
 
     if (!response.ok) {
         const error = await response.text();
-        throw new Error(error || `请求失败: ${response.status}`);
+        let message = error || `请求失败: ${response.status}`;
+        try {
+            message = (JSON.parse(error) as { detail?: string }).detail || message;
+        } catch {
+            // 保留非 JSON 错误文本。
+        }
+        throw new ApiError(response.status, message);
     }
 
     return response.json();
+}
+
+async function requestBlob(endpoint: string, options: RequestInit = {}): Promise<Blob> {
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        ...options,
+        headers: {
+            "Content-Type": "application/json",
+            ...options.headers,
+        },
+    });
+
+    if (response.status === 401 && typeof window !== "undefined") {
+        localStorage.removeItem("bili_session");
+        localStorage.removeItem("bili_user");
+        window.location.href = "/";
+        throw new Error("会话已过期，请重新登录");
+    }
+
+    if (!response.ok) {
+        const payload = await response.json().catch(() => null) as { detail?: string } | null;
+        throw new ApiError(response.status, payload?.detail || `导出失败: ${response.status}`);
+    }
+
+    return response.blob();
 }
 
 // ==================== 类型定义 ====================
@@ -281,6 +318,47 @@ export const knowledgeApi = {
     // 删除视频
     deleteVideo: (bvid: string) =>
         request<{ message: string }>(`/knowledge/video/${bvid}`, { method: "DELETE" }),
+
+    // 导出视频 Markdown
+    exportMarkdown: (
+        bvid: string,
+        mode: "original" | "ai",
+        sessionId: string,
+        operationId: string,
+        signal?: AbortSignal
+    ) =>
+        requestBlob(
+            `/knowledge/video/${encodeURIComponent(bvid)}/export?session_id=${encodeURIComponent(sessionId)}`,
+            {
+                method: "POST",
+                body: JSON.stringify({ mode, operation_id: operationId }),
+                signal,
+            }
+        ),
+
+    // 单视频入库
+    ingestVideo: (
+        bvid: string,
+        folderId: number,
+        sessionId: string,
+        operationId: string,
+        signal?: AbortSignal
+    ) =>
+        request<{ bvid: string; title: string; message: string }>(
+            `/knowledge/video/${encodeURIComponent(bvid)}/ingest?session_id=${encodeURIComponent(sessionId)}`,
+            {
+                method: "POST",
+                body: JSON.stringify({ folder_id: folderId, operation_id: operationId }),
+                signal,
+            }
+        ),
+
+    // 取消单视频导出或入库
+    cancelOperation: (operationId: string, sessionId: string) =>
+        request<{ message: string }>(
+            `/knowledge/operations/${encodeURIComponent(operationId)}/cancel?session_id=${encodeURIComponent(sessionId)}`,
+            { method: "POST" }
+        ),
 };
 
 // 对话相关

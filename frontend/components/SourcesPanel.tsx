@@ -11,11 +11,17 @@ import {
   OrganizePreviewResponse,
 } from "@/lib/api";
 import OrganizePreviewModal from "@/components/OrganizePreviewModal";
+import ExportMarkdownModal from "@/components/ExportMarkdownModal";
 
 interface Props {
   sessionId: string;
   onBuildDone?: () => void;
   onSelectionChange?: (folderIds: number[]) => void;
+}
+
+interface ExportTarget {
+  video: Video;
+  folderId: number;
 }
 
 export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange }: Props) {
@@ -31,6 +37,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
   const [organizePreview, setOrganizePreview] = useState<OrganizePreviewResponse | null>(null);
   const [organizeMessage, setOrganizeMessage] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [exportTarget, setExportTarget] = useState<ExportTarget | null>(null);
 
   // 加载收藏夹列表（从B站获取）
   const loadFolders = useCallback(async () => {
@@ -338,8 +345,25 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
                         ) : (
                           f.videos?.map((v) => (
                             <div key={v.bvid} className="video-item">
-                              <span className="text-[var(--accent)]">▶</span>
-                              <span className="truncate" title={v.title}>{v.title}</span>
+                              <button
+                                className="video-export-button"
+                                onClick={() => setExportTarget({ video: v, folderId: f.media_id })}
+                                title="导出 Markdown"
+                                aria-label={`导出 ${v.title}`}
+                              >
+                                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                  <path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                                </svg>
+                              </button>
+                              <a
+                                className="video-title-link"
+                                href={`https://www.bilibili.com/video/${v.bvid}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={`${v.title} · 打开原视频`}
+                              >
+                                {v.title}
+                              </a>
                             </div>
                           ))
                         )}
@@ -410,6 +434,17 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
         errorMessage={organizeMessage}
         onClose={() => setOrganizeOpen(false)}
         onApplied={refresh}
+      />
+
+      <ExportMarkdownModal
+        video={exportTarget?.video ?? null}
+        folderId={exportTarget?.folderId ?? null}
+        sessionId={sessionId}
+        onClose={() => setExportTarget(null)}
+        onIngested={async () => {
+          await loadStatuses();
+          onBuildDone?.();
+        }}
       />
 
       {confirmOpen && (

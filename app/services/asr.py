@@ -21,6 +21,7 @@ from dashscope.utils.oss_utils import OssUtils
 from loguru import logger
 
 from app.config import settings
+from app.services.cancellation import CancelCheck, ensure_not_cancelled
 
 
 class ASRService:
@@ -32,6 +33,7 @@ class ASRService:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         timeout: Optional[int] = None,
+        cancel_check: CancelCheck = None,
     ):
         self.api_key = api_key or settings.openai_api_key
         self.base_url = base_url or getattr(settings, "dashscope_base_url", None)
@@ -39,6 +41,7 @@ class ASRService:
         self.timeout = timeout or getattr(settings, "asr_timeout", 600)
         self.local_model = getattr(settings, "asr_model_local", self.model)
         self.input_format = getattr(settings, "asr_input_format", "pcm")
+        self.cancel_check = cancel_check
 
     def _configure(self) -> None:
         if not self.api_key:
@@ -128,6 +131,7 @@ class ASRService:
 
     def _recognize_local_file(self, file_path: str) -> Optional[str]:
         """使用 Recognition 直传本地音频"""
+        ensure_not_cancelled(self.cancel_check)
         self._configure()
         if not os.path.exists(file_path):
             logger.warning(f"ASR 本地文件不存在: {file_path}")
@@ -149,6 +153,7 @@ class ASRService:
                 sample_rate=16000,
             )
             result = recognizer.call(input_path)
+            ensure_not_cancelled(self.cancel_check)
             logger.info(
                 "ASR Recognition 结果: status_code={}, code={}, message={}, request_id={}",
                 getattr(result, "status_code", None),
@@ -182,6 +187,7 @@ class ASRService:
                     logger.debug(f"ASR 临时文件清理失败: {path}")
 
     def _download_transcription(self, url: str) -> Optional[str]:
+        ensure_not_cancelled(self.cancel_check)
         try:
             raw = urlrequest.urlopen(url).read().decode("utf-8")
             data = json.loads(raw)
@@ -263,6 +269,7 @@ class ASRService:
         return data if isinstance(data, dict) else None
 
     def _transcribe_sync_restful(self, audio_url: str, model: str) -> Optional[str]:
+        ensure_not_cancelled(self.cancel_check)
         self._configure()
         task_id = self._submit_transcription_task_restful(audio_url, model)
         if not task_id:
@@ -273,10 +280,12 @@ class ASRService:
         start = time.time()
         output = None
         while True:
+            ensure_not_cancelled(self.cancel_check)
             if time.time() - start > self.timeout:
                 logger.warning("ASR 任务超时(RESTful)")
                 return None
             output = self._fetch_transcription_task_restful(task_id)
+            ensure_not_cancelled(self.cancel_check)
             if not output:
                 time.sleep(1.5)
                 continue
@@ -314,6 +323,7 @@ class ASRService:
         return None
 
     def _transcribe_sync(self, audio_url: str) -> Optional[str]:
+        ensure_not_cancelled(self.cancel_check)
         self._configure()
         if audio_url.startswith("oss://"):
             return self._transcribe_sync_restful(audio_url, self.model)
@@ -341,6 +351,7 @@ class ASRService:
 
         start = time.time()
         while True:
+            ensure_not_cancelled(self.cancel_check)
             status = self._get_output_value(output, "task_status")
             if status in ("SUCCEEDED", "FAILED"):
                 break
@@ -349,6 +360,7 @@ class ASRService:
                 return None
             time.sleep(1.5)
             resp = Transcription.fetch(task=task_id)
+            ensure_not_cancelled(self.cancel_check)
             output = getattr(resp, "output", None)
 
         status_code = getattr(resp, "status_code", None)
@@ -404,11 +416,15 @@ class ASRService:
             return None
 
     async def transcribe_url(self, audio_url: str) -> Optional[str]:
-        return await asyncio.to_thread(self._transcribe_sync, audio_url)
+        result = await asyncio.to_thread(self._transcribe_sync, audio_url)
+        ensure_not_cancelled(self.cancel_check)
+        return result
 
     async def transcribe_local_file(self, file_path: str) -> Optional[str]:
         """本地文件直传识别（Recognition）"""
-        return await asyncio.to_thread(self._recognize_local_file, file_path)
+        result = await asyncio.to_thread(self._recognize_local_file, file_path)
+        ensure_not_cancelled(self.cancel_check)
+        return result
 
     def _transcribe_sync_with_model(self, audio_url: str, model: str) -> Optional[str]:
         """使用指定模型转写（用于本地文件上传）"""

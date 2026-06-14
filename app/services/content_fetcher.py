@@ -16,6 +16,7 @@ from loguru import logger
 from app.models import VideoContent, ContentSource
 from app.services.bilibili import BilibiliService
 from app.services.asr import ASRService
+from app.services.cancellation import CancelCheck, ensure_not_cancelled
 
 
 class ContentFetcher:
@@ -27,9 +28,15 @@ class ContentFetcher:
     2. 视频基本信息 (兜底)
     """
     
-    def __init__(self, bilibili_service: BilibiliService, asr_service: ASRService):
+    def __init__(
+        self,
+        bilibili_service: BilibiliService,
+        asr_service: ASRService,
+        cancel_check: CancelCheck = None,
+    ):
         self.bili = bilibili_service
         self.asr = asr_service
+        self.cancel_check = cancel_check
     
     async def fetch_content(
         self,
@@ -52,11 +59,13 @@ class ContentFetcher:
         Returns:
             VideoContent 对象
         """
+        ensure_not_cancelled(self.cancel_check)
         # 获取视频基本信息
         video_info = None
         if not cid or not title:
             try:
                 video_info = await self.bili.get_video_info(bvid)
+                ensure_not_cancelled(self.cancel_check)
                 if not cid:
                     cid = video_info.get("cid")
                 if not title:
@@ -84,6 +93,7 @@ class ContentFetcher:
         logger.info(f"[{bvid}] 已跳过 AI 摘要，优先使用 ASR")
 
         asr_text = await self._try_asr(bvid, cid)
+        ensure_not_cancelled(self.cancel_check)
         if asr_text:
             logger.info(f"[{bvid}] 使用 ASR 文本")
             return VideoContent(
@@ -101,6 +111,7 @@ class ContentFetcher:
         if not video_info:
             try:
                 video_info = await self.bili.get_video_info(bvid)
+                ensure_not_cancelled(self.cancel_check)
             except Exception as e:
                 logger.debug(f"[{bvid}] 获取视频信息失败(兜底): {e}")
 
@@ -127,17 +138,21 @@ class ContentFetcher:
     async def _try_asr(self, bvid: str, cid: int) -> Optional[str]:
         """尝试进行音频转写"""
         try:
+            ensure_not_cancelled(self.cancel_check)
             audio_url = await self.bili.get_audio_url(bvid, cid)
+            ensure_not_cancelled(self.cancel_check)
             if not audio_url:
                 logger.info(f"[{bvid}] 未获取到音频 URL")
                 return None
             status = await self._probe_audio_url(bvid, audio_url)
+            ensure_not_cancelled(self.cancel_check)
             if status is not None and status < 400:
                 logger.info(f"[{bvid}] 音频 URL 可达，使用 Transcription")
                 text = await self.asr.transcribe_url(audio_url)
             else:
                 logger.info(f"[{bvid}] 音频 URL 不可达，使用 Recognition 兜底")
                 text = await self._try_asr_with_local_audio(bvid, cid, audio_url)
+            ensure_not_cancelled(self.cancel_check)
 
             if not text or len(text) < 50:
                 logger.info(f"[{bvid}] ASR 内容过少")
@@ -184,6 +199,7 @@ class ContentFetcher:
         self, bvid: str, cid: int, audio_url: str
     ) -> Optional[str]:
         """本地下载后使用 Recognition 直传"""
+        ensure_not_cancelled(self.cancel_check)
         tmp_dir = os.path.join("data", "asr_tmp")
         os.makedirs(tmp_dir, exist_ok=True)
 
@@ -197,6 +213,7 @@ class ContentFetcher:
         file_path = os.path.join(tmp_dir, filename)
 
         ok = await self.bili.download_audio_to_file(audio_url, file_path)
+        ensure_not_cancelled(self.cancel_check)
         if not ok:
             logger.info(f"[{bvid}] 本地下载音频失败")
             return None
@@ -210,6 +227,7 @@ class ContentFetcher:
             return None
 
         text = await self.asr.transcribe_local_file(file_path)
+        ensure_not_cancelled(self.cancel_check)
         if text:
             preview = text[:120].replace("\n", " ").strip()
             logger.info(f"[{bvid}] Recognition ASR 成功，长度={len(text)}，预览：{preview}")

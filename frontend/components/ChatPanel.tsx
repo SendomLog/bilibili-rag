@@ -10,12 +10,105 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: Array<{ bvid: string; title: string; url: string }>;
+  trace?: TraceEvent[];
+  traceOpen?: boolean;
+  traceDone?: boolean;
 }
+
+interface TraceEvent {
+  type: "status" | "scope" | "retrieval" | "snippet";
+  stage?: string;
+  message?: string;
+  title?: string;
+  preview?: string;
+  url?: string;
+  folder_count?: number;
+  video_count?: number;
+  vector_count?: number;
+  keyword_count?: number;
+  final_count?: number;
+  elapsed_ms?: number;
+}
+
+type StreamEvent =
+  | TraceEvent
+  | { type: "token"; content: string }
+  | { type: "sources"; items: Array<{ bvid: string; title: string; url: string }> }
+  | { type: "done" }
+  | { type: "error"; message: string };
 
 interface Props {
   statsKey?: number;
   sessionId?: string;
   folderIds?: number[];
+}
+
+function ExecutionTrace({
+  events,
+  open,
+  done,
+  onToggle,
+}: {
+  events: TraceEvent[];
+  open: boolean;
+  done: boolean;
+  onToggle: () => void;
+}) {
+  const snippets = events.filter((event) => event.type === "snippet");
+  const steps = events.filter((event) => event.type !== "snippet");
+  const latest = steps.at(-1)?.message || (done ? "执行完成" : "正在处理");
+
+  return (
+    <div className={`execution-trace ${done ? "done" : "running"}`}>
+      <button
+        type="button"
+        className="execution-trace-head"
+        aria-expanded={open}
+        onClick={onToggle}
+      >
+        <span className="execution-trace-signal" aria-hidden="true" />
+        <span className="execution-trace-title">{done ? "执行过程" : latest}</span>
+        {done && <span className="execution-trace-summary">{steps.length} 个步骤</span>}
+        <svg className={open ? "open" : ""} viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <path d="m6 8 4 4 4-4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="execution-trace-body">
+          <div className="execution-steps">
+            {steps.map((event, index) => (
+              <div className="execution-step" key={`${event.type}-${event.stage}-${index}`}>
+                <span className="execution-step-mark">{index + 1}</span>
+                <span>{event.message}</span>
+                {event.elapsed_ms != null && (
+                  <small>{(event.elapsed_ms / 1000).toFixed(2)}s</small>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {snippets.length > 0 && (
+            <div className="execution-snippets">
+              <div className="execution-snippets-label">召回片段</div>
+              {snippets.map((event, index) => (
+                <a
+                  className="execution-snippet"
+                  href={event.url || undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  key={`${event.title}-${index}`}
+                >
+                  <strong>{event.title}</strong>
+                  <span>{event.preview}</span>
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
@@ -24,8 +117,6 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
   const [loading, setLoading] = useState(false);
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
-  const marker = "[[SOURCES_JSON]]";
-  const contentStartMarker = "[[CONTENT_START]]";
 
   useEffect(() => {
     knowledgeApi.getStats().then(setStats).catch(() => { });
@@ -44,10 +135,19 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
     setMessages((prev) => [
       ...prev,
       { id: userId, role: "user", content: q },
-      { id: assistantId, role: "assistant", content: "", sources: [] },
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        sources: [],
+        trace: [{ type: "status", stage: "connecting", message: "正在连接问答服务" }],
+        traceOpen: true,
+        traceDone: false,
+      },
     ]);
     setLoading(true);
 
+    let receivedEvent = false;
     try {
       const response = await fetch(`${API_BASE_URL}/chat/ask/stream`, {
         method: "POST",
@@ -67,117 +167,136 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
-      let done = false;
       let answerBuffer = "";
       let pendingBuffer = "";
-      let metadataParsed = false;
-      let legacySourcesJson = "";
-      let inLegacySources = false;
       let pendingSources: Array<{ bvid: string; title: string; url: string }> = [];
+      let streamCompleted = false;
 
-      const parseSources = (raw: string) => {
-        if (!raw) return [];
-        try {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            return parsed;
-          }
-        } catch {
-          // 忽略解析错误，避免影响主文本
+      const applyEvent = (event: StreamEvent) => {
+        receivedEvent = true;
+        if (event.type === "token") {
+          answerBuffer += event.content;
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId ? { ...message, content: answerBuffer } : message
+            )
+          );
+          return;
         }
-        return [];
-      };
-
-      const revealSources = () => {
-        if (pendingSources.length === 0) return;
+        if (event.type === "sources") {
+          pendingSources = event.items;
+          return;
+        }
+        if (event.type === "done") {
+          streamCompleted = true;
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? { ...message, sources: pendingSources, traceOpen: false, traceDone: true }
+                : message
+            )
+          );
+          return;
+        }
+        if (event.type === "error") {
+          streamCompleted = true;
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    content: answerBuffer || `错误: ${event.message}`,
+                    trace: [...(message.trace || []), { type: "status", stage: "error", message: event.message }],
+                    traceOpen: true,
+                    traceDone: true,
+                  }
+                : message
+            )
+          );
+          return;
+        }
         setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantId ? { ...m, sources: pendingSources } : m
+          prev.map((message) =>
+            message.id === assistantId
+              ? { ...message, trace: [...(message.trace || []), event] }
+              : message
           )
         );
       };
 
-      const applyContent = () => {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantId ? { ...m, content: answerBuffer } : m
-          )
-        );
+      const parseLine = (line: string) => {
+        if (!line.trim()) return;
+        const event = JSON.parse(line) as StreamEvent;
+        applyEvent(event);
       };
 
-      while (!done) {
+      while (true) {
         const { value, done: doneReading } = await reader.read();
-        done = doneReading;
         if (value) {
-          const chunk = decoder.decode(value, { stream: !done });
-          if (chunk) {
-            if (!metadataParsed) {
-              pendingBuffer += chunk;
-              const markerIndex = pendingBuffer.indexOf(marker);
-              const contentStartIndex = pendingBuffer.indexOf(contentStartMarker);
-
-              if (markerIndex !== -1 && contentStartIndex !== -1 && markerIndex < contentStartIndex) {
-                const rawSources = pendingBuffer.slice(markerIndex + marker.length, contentStartIndex);
-                pendingSources = parseSources(rawSources);
-                answerBuffer += pendingBuffer.slice(contentStartIndex + contentStartMarker.length);
-                pendingBuffer = "";
-                metadataParsed = true;
-                applyContent();
-              } else if (markerIndex === -1 && pendingBuffer.length > marker.length + contentStartMarker.length) {
-                // 兼容没有元数据头的旧流式响应。
-                answerBuffer += pendingBuffer;
-                pendingBuffer = "";
-                metadataParsed = true;
-                applyContent();
-              }
-            } else {
-              if (inLegacySources) {
-                legacySourcesJson += chunk;
-              } else {
-                answerBuffer += chunk;
-                const legacyMarkerIndex = answerBuffer.indexOf(marker);
-                if (legacyMarkerIndex !== -1) {
-                  legacySourcesJson = answerBuffer.slice(legacyMarkerIndex + marker.length);
-                  answerBuffer = answerBuffer.slice(0, legacyMarkerIndex);
-                  inLegacySources = true;
-                }
-              }
-              applyContent();
-            }
+          pendingBuffer += decoder.decode(value, { stream: !doneReading });
+          const lines = pendingBuffer.split("\n");
+          pendingBuffer = lines.pop() || "";
+          for (const line of lines) {
+            parseLine(line);
           }
         }
+        if (doneReading) break;
       }
-
-      if (!metadataParsed && pendingBuffer) {
-        const markerIndex = pendingBuffer.indexOf(marker);
-        const contentStartIndex = pendingBuffer.indexOf(contentStartMarker);
-        if (markerIndex !== -1 && contentStartIndex !== -1 && markerIndex < contentStartIndex) {
-          pendingSources = parseSources(pendingBuffer.slice(markerIndex + marker.length, contentStartIndex));
-          answerBuffer += pendingBuffer.slice(contentStartIndex + contentStartMarker.length);
-        } else {
-          answerBuffer += pendingBuffer;
+      if (pendingBuffer.trim()) {
+        parseLine(pendingBuffer);
+      }
+      if (!streamCompleted) {
+        throw new Error("流式响应意外结束");
+      }
+    } catch (streamError) {
+      if (!receivedEvent) {
+        try {
+          const res = await chatApi.ask(q, sessionId, folderIds);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    content: res.answer,
+                    sources: res.sources,
+                    trace: [...(m.trace || []), { type: "status", stage: "fallback", message: "流式过程不可用，已切换普通回答" }],
+                    traceOpen: false,
+                    traceDone: true,
+                  }
+                : m
+            )
+          );
+        } catch (err) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    content: `错误: ${err instanceof Error ? err.message : "请求失败"}`,
+                    traceOpen: true,
+                    traceDone: true,
+                  }
+                : m
+            )
+          );
         }
-        applyContent();
-      }
-      if (legacySourcesJson) {
-        pendingSources = parseSources(legacySourcesJson);
-      }
-      revealSources();
-    } catch {
-      try {
-        const res = await chatApi.ask(q, sessionId, folderIds);
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantId ? { ...m, content: res.answer, sources: res.sources } : m
-          )
-        );
-      } catch (err) {
+      } else {
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
               ? {
                   ...m,
-                  content: `错误: ${err instanceof Error ? err.message : "请求失败"}`,
+                  content: m.content || `错误: ${streamError instanceof Error ? streamError.message : "流式响应失败"}`,
+                  trace: [
+                    ...(m.trace || []),
+                    {
+                      type: "status",
+                      stage: "error",
+                      message: streamError instanceof Error ? streamError.message : "流式响应失败",
+                    },
+                  ],
+                  traceOpen: true,
+                  traceDone: true,
                 }
               : m
           )
@@ -231,6 +350,20 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
               {messages.map((m) => (
                 <div key={m.id} className={`message ${m.role}`}>
                   <div className="message-bubble">
+                    {m.trace && m.trace.length > 0 && (
+                      <ExecutionTrace
+                        events={m.trace}
+                        open={m.traceOpen ?? false}
+                        done={m.traceDone ?? false}
+                        onToggle={() =>
+                          setMessages((prev) =>
+                            prev.map((message) =>
+                              message.id === m.id ? { ...message, traceOpen: !message.traceOpen } : message
+                            )
+                          )
+                        }
+                      />
+                    )}
                     <ReactMarkdown className="markdown" remarkPlugins={[remarkGfm]}>
                       {m.content}
                     </ReactMarkdown>
@@ -246,17 +379,6 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
                   </div>
                 </div>
               ))}
-              {loading && (
-                <div className="message assistant">
-                  <div className="message-bubble">
-                    <div className="flex gap-1">
-                      {[0, 1, 2].map((i) => (
-                        <div key={i} className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-pulse" style={{ animationDelay: `${i * 0.15}s` }} />
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              )}
               <div ref={endRef} />
             </div>
           )}

@@ -6,16 +6,16 @@ import asyncio
 import re
 import json
 import time
-from typing import List, Optional
+from typing import Callable, List, Optional
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 from langchain.schema import Document
 
-from app.database import get_db
+from app.database import get_db, get_db_context
 from app.models import ChatRequest, ChatResponse, FavoriteFolder, FavoriteVideo, VideoCache
 from app.config import settings
 from app.routers.knowledge import get_rag_service
@@ -27,8 +27,7 @@ from app.services.retrieval import (
 )
 
 router = APIRouter(prefix="/chat", tags=["对话"])
-SOURCES_MARKER = "[[SOURCES_JSON]]"
-CONTENT_START_MARKER = "[[CONTENT_START]]"
+ProgressCallback = Optional[Callable[[dict], None]]
 
 def _get_llm_client() -> OpenAI:
     """获取 LLM 客户端"""
@@ -38,6 +37,44 @@ def _get_llm_client() -> OpenAI:
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
     )
+
+def _get_async_llm_client() -> AsyncOpenAI:
+    """获取异步 LLM 客户端，用于流式问答。"""
+    if not settings.openai_api_key:
+        raise HTTPException(status_code=400, detail="未配置 LLM API Key")
+    return AsyncOpenAI(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+    )
+
+def _emit_progress(callback: ProgressCallback, event_type: str, **payload) -> None:
+    if callback:
+        callback({"type": event_type, **payload})
+
+def _encode_stream_event(type: str, **payload) -> str:
+    """编码一条 NDJSON 流式事件。"""
+    return json.dumps({"type": type, **payload}, ensure_ascii=False) + "\n"
+
+def _route_label(route: str) -> str:
+    return {
+        "direct": "直接回答",
+        "db_list": "读取收藏夹清单",
+        "db_content": "汇总收藏夹内容",
+        "vector": "检索知识库",
+    }.get(route, route)
+
+def _build_snippet_event(doc: Document) -> dict:
+    meta = doc.metadata or {}
+    preview = re.sub(r"\s+", " ", doc.page_content or "").strip()
+    if len(preview) > 220:
+        preview = preview[:220].rstrip() + "..."
+    bvid = meta.get("bvid", "")
+    return {
+        "bvid": bvid,
+        "title": meta.get("title", "") or bvid or "未命名视频",
+        "preview": preview,
+        "url": meta.get("url") or (f"https://www.bilibili.com/video/{bvid}" if bvid else ""),
+    }
 
 def _build_overview_messages(context: str, question: str) -> list[dict]:
     system = (
@@ -499,7 +536,11 @@ async def _get_video_titles_context(db: AsyncSession, folder_ids: List[int], lim
     context_parts = [f"【{folder_name}】\n" + "\n".join(videos) for folder_name, videos in grouped.items()]
     return "\n\n".join(context_parts)
 
-async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[list[dict], List[dict], str]:
+async def _prepare_messages(
+    request: ChatRequest,
+    db: AsyncSession,
+    progress_callback: ProgressCallback = None,
+) -> tuple[list[dict], List[dict], str]:
     """准备 LLM 消息与来源信息"""
     prepare_started = time.perf_counter()
     question = request.question.strip()
@@ -509,6 +550,14 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         folder_ids = await _get_folder_ids_for_session(db, request.session_id, request.folder_ids)
         logger.info(f"Session: {request.session_id}, 关联 FolderIDs: {folder_ids}")
     bvids = await _get_bvids_by_folder_ids(db, folder_ids) if folder_ids else []
+    _emit_progress(
+        progress_callback,
+        "scope",
+        stage="scope",
+        folder_count=len(folder_ids),
+        video_count=len(bvids),
+        message=f"已确定检索范围：{len(folder_ids)} 个收藏夹，共 {len(bvids)} 个视频",
+    )
     has_data = len(bvids) > 0
     is_collection_intent = _is_collection_intent(question)
     is_general = _is_general_question(question)
@@ -528,6 +577,13 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         route = _route_with_rules(question, is_collection_intent, related=False)
         route_source = "RULE"
     logger.info(f"路由策略: {route_source} => {route}，耗时={time.perf_counter() - route_started:.2f}s")
+    _emit_progress(
+        progress_callback,
+        "status",
+        stage="routing",
+        route=route,
+        message=f"问题处理方式：{_route_label(route)}",
+    )
     # 纠偏
     if is_general:
         route = "direct"
@@ -547,10 +603,30 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
             return _build_direct_messages(question), [], question
         if is_collection_intent:
             route = "vector"
+            _emit_progress(
+                progress_callback,
+                "status",
+                stage="routing",
+                route=route,
+                message=f"问题处理方式：{_route_label(route)}",
+            )
         else:
+            _emit_progress(
+                progress_callback,
+                "status",
+                stage="relatedness",
+                message="正在检查问题与知识库内容的关联",
+            )
             related = await _is_related_to_collection(db, folder_ids, question)
             if related:
                 route = "vector"
+                _emit_progress(
+                    progress_callback,
+                    "status",
+                    stage="routing",
+                    route=route,
+                    message=f"问题处理方式：{_route_label(route)}",
+                )
             else:
                 title_context = await _get_video_titles_context(db, folder_ids, limit=50)
                 messages = _build_direct_messages_with_context(title_context, question) if title_context else _build_direct_messages(question)
@@ -562,21 +638,37 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         return messages, [], question
     # 4) 列表类问题
     if route == "db_list":
+        _emit_progress(progress_callback, "status", stage="retrieval", message="正在读取收藏夹视频清单")
         if related is None and not is_collection_intent:
             related = await _is_related_to_collection(db, folder_ids, question)
         if not related and not is_collection_intent:
             return _build_direct_messages(question), [], question
         context, sources = await _get_video_context(db, folder_ids, include_content=False, limit=50)
+        _emit_progress(
+            progress_callback,
+            "retrieval",
+            stage="retrieval",
+            final_count=len(sources),
+            message=f"已读取 {len(sources)} 个相关视频条目",
+        )
         if not context:
             return _build_fallback_messages("（暂无信息，请入库）", question), sources, question
         return _build_db_list_messages(context, question), sources, question
     # 5) 总结类问题
     if route == "db_content":
+        _emit_progress(progress_callback, "status", stage="retrieval", message="正在汇总已入库视频内容")
         if related is None and not is_collection_intent:
             related = await _is_related_to_collection(db, folder_ids, question)
         if not related and not is_collection_intent:
             return _build_direct_messages(question), [], question
         context, sources = await _get_video_context(db, folder_ids, include_content=True, limit=None)
+        _emit_progress(
+            progress_callback,
+            "retrieval",
+            stage="retrieval",
+            final_count=len(sources),
+            message=f"已读取 {len(sources)} 个视频的入库内容",
+        )
         if not context:
             return _build_fallback_messages("（暂无信息，请入库）", question), sources, question
         sources = _rank_sources_by_question(sources, question)
@@ -591,6 +683,12 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
     docs: List[Document] = []
     try:
         recall_started = time.perf_counter()
+        _emit_progress(
+            progress_callback,
+            "status",
+            stage="retrieval",
+            message="正在并发执行向量检索与关键词检索",
+        )
         top_k = max(1, settings.retrieval_top_k)
         candidate_k = max(top_k, settings.retrieval_candidate_k)
         vector_task = asyncio.to_thread(
@@ -611,6 +709,18 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         logger.info(
             f"混合检索完成：vector={len(vector_docs)} keyword={len(keyword_docs)} final={len(docs)}，耗时={time.perf_counter() - recall_started:.2f}s"
         )
+        _emit_progress(
+            progress_callback,
+            "retrieval",
+            stage="retrieval",
+            vector_count=len(vector_docs),
+            keyword_count=len(keyword_docs),
+            final_count=len(docs),
+            elapsed_ms=round((time.perf_counter() - recall_started) * 1000),
+            message=f"检索完成：筛选出 {len(docs)} 个相关片段",
+        )
+        for doc in docs[:5]:
+            _emit_progress(progress_callback, "snippet", stage="retrieval", **_build_snippet_event(doc))
     except Exception as e:
         logger.error(f"混合检索失败: {e}")
         raise RuntimeError("知识库检索失败") from e
@@ -644,31 +754,69 @@ async def ask_question(request: ChatRequest, db: AsyncSession = Depends(get_db))
         raise HTTPException(status_code=500, detail=f"问答失败: {str(e)}")
 
 @router.post("/ask/stream")
-async def ask_question_stream(request: ChatRequest, db: AsyncSession = Depends(get_db)):
-    """流式问答"""
+async def ask_question_stream(request: ChatRequest):
+    """以 NDJSON 事件流返回执行过程与答案。"""
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
-    try:
-        messages, sources, _ = await _prepare_messages(request, db)
-        client = _get_llm_client()
-        def generate():
-            yield (
-                f"{SOURCES_MARKER}"
-                f"{json.dumps(sources[:5], ensure_ascii=False)}"
-                f"{CONTENT_START_MARKER}"
+
+    async def generate():
+        yield _encode_stream_event("status", stage="routing", message="正在分析问题")
+        progress_queue: asyncio.Queue[dict] = asyncio.Queue()
+        prepare_task: Optional[asyncio.Task] = None
+
+        def report(event: dict) -> None:
+            progress_queue.put_nowait(event)
+
+        try:
+            async with get_db_context() as stream_db:
+                try:
+                    prepare_task = asyncio.create_task(
+                        _prepare_messages(request, stream_db, progress_callback=report)
+                    )
+                    while not prepare_task.done():
+                        try:
+                            event = await asyncio.wait_for(progress_queue.get(), timeout=0.1)
+                            yield _encode_stream_event(**event)
+                        except asyncio.TimeoutError:
+                            continue
+                    while not progress_queue.empty():
+                        yield _encode_stream_event(**progress_queue.get_nowait())
+                    messages, sources, _ = await prepare_task
+                finally:
+                    if prepare_task and not prepare_task.done():
+                        prepare_task.cancel()
+                        await asyncio.gather(prepare_task, return_exceptions=True)
+
+            yield _encode_stream_event("sources", items=sources[:5])
+            yield _encode_stream_event("status", stage="generation", message="正在基于检索结果生成回答")
+
+            client = _get_async_llm_client()
+            stream = await client.chat.completions.create(
+                model=settings.llm_model,
+                messages=messages,
+                temperature=0.5,
+                stream=True,
             )
-            stream = client.chat.completions.create(model=settings.llm_model, messages=messages, temperature=0.5, stream=True)
-            for chunk in stream:
+            emitted_content = False
+            async for chunk in stream:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
                 if delta and delta.content:
-                    yield delta.content
-        return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"流式问答失败: {e}")
-        raise HTTPException(status_code=500, detail=f"流式问答失败: {str(e)}")
+                    emitted_content = True
+                    yield _encode_stream_event("token", content=delta.content)
+            if not emitted_content:
+                raise RuntimeError("AI 回答返回空结果")
+            yield _encode_stream_event("done")
+        except Exception as e:
+            logger.error(f"流式问答失败: {e}")
+            yield _encode_stream_event("error", message=f"问答失败: {e}")
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson; charset=utf-8",
+        headers={"X-Accel-Buffering": "no"},
+    )
 
 @router.post("/search")
 async def search_videos(query: str, k: int = 5):
